@@ -163,8 +163,8 @@ def check_csv_dependencies():
 
 def convert_xlsx_to_csv(xlsx_path, base_output_path):
     # Hindsight's xlsx has one sheet per artifact type (Timeline, Chrome
-    # Preferences, ...); write each sheet to its own CSV, same as
-    # xlsx_csv-v4.py's --all mode.
+    # Preferences, ...); write each sheet to its own CSV. Ported from an
+    # xlsx-to-csv script by Nicolas Saputra Gunawan (github.com/jon-brandy).
     import pandas as pd
 
     # row 0 of every Hindsight sheet is a title/section-group row, not
