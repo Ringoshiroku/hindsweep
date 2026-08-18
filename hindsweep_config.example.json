@@ -1,5 +1,5 @@
 {
-  "hindsight_path": "hindsight.exe",
+  "hindsight_path": "../hindsight/hindsight.py",
   "timezone": "Asia/Jakarta",
   "format": "csv",
   "decrypt": null,

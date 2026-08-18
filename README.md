@@ -43,9 +43,11 @@ the real parsing.
 
 1. Make sure Hindsight is installed and runs on its own first (see
    [Requirements](#requirements)).
-2. Open `hindsweep_config.json` and fill in `hindsight_path` (if it isn't
-   already a sibling `hindsight/` folder) and `timezone`. Everything else has
-   a sensible default and rarely needs to change.
+2. Copy `hindsweep_config.example.json` to `hindsweep_config.json` and fill
+   in `hindsight_path` (if it isn't already a sibling `hindsight/` folder)
+   and `timezone`. Everything else has a sensible default and rarely needs
+   to change. `hindsweep_config.json` is your own local config (gitignored,
+   not tracked); only the `.example.json` template is committed.
 3. Run it against a root directory:
    ```sh
    python hindsweep.py -i "G:\Project\WorkstationA\KAPE\F"   # macOS/Linux: python3 instead of python
@@ -117,5 +119,6 @@ A flag passed on the command line always overrides the config file.
 
 | File | Purpose |
 |---|---|
-| `hindsweep_config.json` | settings that stay the same across runs; fill in before your first run |
+| `hindsweep_config.example.json` | committed template; copy to `hindsweep_config.json` to start |
+| `hindsweep_config.json` | your local settings (gitignored); fill in before your first run |
 | `<prefix>_output/` | Hindsight output per profile (one file, or with the default `csv` format, one CSV per sheet), plus the run summary and log for that run |
