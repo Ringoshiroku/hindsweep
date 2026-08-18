@@ -38,6 +38,11 @@ the real parsing.
   HindSweep, anything else (e.g. `hindsight.exe`) is launched directly.
   HindSweep expects `../hindsight/hindsight.py` next to itself by default,
   i.e. `hindsight/` and this `hindsweep/` folder as sibling directories.
+  When running the `.py` script (not needed for `hindsight.exe`), HindSweep
+  sets `PYTHONUTF8=1`/`PYTHONIOENCODING=utf-8` for it: Hindsight's `rich`
+  dependency otherwise crashes trying to render its progress spinner on a
+  non-UTF-8 Windows console, which is exactly the non-interactive setup
+  HindSweep runs it in.
 
 ## Getting started
 

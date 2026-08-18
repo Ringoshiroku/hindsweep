@@ -182,7 +182,8 @@ def convert_xlsx_to_csv(xlsx_path, base_output_path):
 def run_hindsight(hindsight_path, profile, output_path, config, log_path):
     # hindsight_path may be the .py script (needs this interpreter) or a
     # packaged binary like hindsight.exe (runs on its own).
-    launcher = [sys.executable, hindsight_path] if hindsight_path.lower().endswith('.py') else [hindsight_path]
+    is_py_launch = hindsight_path.lower().endswith('.py')
+    launcher = [sys.executable, hindsight_path] if is_py_launch else [hindsight_path]
     # Hindsight itself only knows xlsx/jsonl/sqlite; for csv, have it write
     # xlsx and convert that afterward.
     hindsight_format = 'xlsx' if config['format'] == 'csv' else config['format']
@@ -200,9 +201,18 @@ def run_hindsight(hindsight_path, profile, output_path, config, log_path):
     if config.get('nocopy'):
         cmd.append('--nocopy')
 
+    env = None
+    if is_py_launch:
+        # Hindsight's "rich" dependency crashes trying to render its
+        # progress spinner (Unicode braille glyphs) on a non-UTF-8 Windows
+        # console, which is exactly the non-interactive setup we run it in.
+        # Forcing Python's UTF-8 mode avoids that crash; hindsight.exe
+        # doesn't hit this, so it's only needed for the .py launch.
+        env = {**os.environ, 'PYTHONUTF8': '1', 'PYTHONIOENCODING': 'utf-8'}
+
     start = time.time()
     try:
-        result = subprocess.run(cmd, stdin=subprocess.DEVNULL)
+        result = subprocess.run(cmd, stdin=subprocess.DEVNULL, env=env)
         success = result.returncode == 0
     except OSError as e:
         print(f'  Failed to launch hindsight: {e}', file=sys.stderr)
