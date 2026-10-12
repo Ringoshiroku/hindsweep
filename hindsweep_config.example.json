@@ -2,7 +2,7 @@
   "hindsight_path": "../hindsight/hindsight.py",
   "timezone": "Asia/Jakarta",
   "format": "csv",
-  "decrypt": null,
+  "decrypt": "auto",
   "nocopy": false,
   "default_prefix": "test_case",
   "default_root": null,

@@ -9,6 +9,12 @@ runs Hindsight on each one, and writes a run summary. It has no server-side
 component and doesn't parse anything itself: it drives Hindsight, which does
 the real parsing.
 
+It runs on Windows, Linux and macOS, and handles evidence from any of them
+regardless of which OS you run it on: a Linux image can be swept from
+Windows and the reverse. For Linux and macOS profiles it also fills in the
+Hindsight options those layouts need (`-c` for the out-of-profile cache,
+`-d` for decryption); see [Linux and macOS profiles](#linux-and-macos-profiles).
+
 ## Requirements
 
 - Python 3.11+. Run it with whichever command your OS uses for Python 3:
@@ -31,11 +37,13 @@ the real parsing.
   cd hindsight
   pip install -r requirements.txt
   ```
-  A downloaded release build (`hindsight.exe`) works too, no Python
-  environment needed for it, just point `hindsight_path` in the config
-  (below) at it. HindSweep detects which kind it's calling from the file
-  extension: a `.py` path is run with the same Python that's running
-  HindSweep, anything else (e.g. `hindsight.exe`) is launched directly.
+  A downloaded release build (`hindsight.exe`, or a Linux/macOS binary)
+  works too, no Python environment needed for it, just point
+  `hindsight_path` in the config (below) at it. HindSweep detects which kind
+  it's calling from the file extension: a `.py` path is run with the same
+  Python that's running HindSweep, anything else (e.g. `hindsight.exe`) is
+  launched directly, so on Linux/macOS make sure the binary is executable
+  (`chmod +x`).
   HindSweep expects `../hindsight/hindsight.py` next to itself by default,
   i.e. `hindsight/` and this `hindsweep/` folder as sibling directories.
   When running the `.py` script (not needed for `hindsight.exe`), HindSweep
@@ -71,11 +79,18 @@ python hindsweep.py --list-only -i "G:\Project\WorkstationA\KAPE\F"
 # Process everything found under a root, using config defaults
 python hindsweep.py -i "G:\Project\WorkstationA\KAPE\F"
 
+# A mounted Linux or macOS image works the same way
+python3 hindsweep.py -i /mnt/evidence/ubuntu_root -o case002
+
 # Same, with a custom case name prefix
 python hindsweep.py -i "G:\Project\WorkstationA\KAPE\F" -o case001
 
-# No -i: scans this machine's own user directories (C:\Users, /home, /Users)
+# No -i: scans this machine's own user directories
+# (C:\Users on Windows, /home and /root on Linux, /Users and /var/root on macOS)
 python hindsweep.py -o case001
+
+# Live Linux scan including /root and other users' homes
+sudo python3 hindsweep.py -o case001
 
 # Only sweep specific browsers
 python hindsweep.py -i "G:\Project\WorkstationA\KAPE\F" --browsers chrome,firefox
@@ -89,7 +104,7 @@ python hindsweep.py -i "G:\Project\WorkstationA\KAPE\F" --browsers chrome,firefo
 | `-o`, `--prefix` | no | `default_prefix` from config (`test_case`) | output/case name prefix |
 | `-t`, `--timezone` | no | `timezone` from config | display timezone for output timestamps |
 | `-f`, `--format` | no | `format` from config (`csv`) | `csv`, `xlsx`, `jsonl`, or `sqlite`. `csv` has Hindsight write xlsx, then converts every sheet to its own CSV per profile and deletes the intermediate xlsx (needs `pandas`/`openpyxl`, see [Requirements](#requirements)) |
-| `-d`, `--decrypt` | no | `decrypt` from config (off) | `mac` or `linux`, passed straight to Hindsight |
+| `-d`, `--decrypt` | no | `decrypt` from config (`auto`) | `auto` picks Hindsight's `-d` per profile (see [Linux and macOS profiles](#linux-and-macos-profiles)); `none` turns it off; `mac` or `linux` passes that value to Hindsight for every profile |
 | `--nocopy` | no | `nocopy` from config (off) | don't copy files before opening them |
 | `--browsers` | no | `browsers` from config (all) | comma-separated list to restrict to, e.g. `chrome,firefox` |
 | `--hindsight-path` | no | `hindsight_path` from config | path to `hindsight.py` or `hindsight.exe` |
@@ -105,20 +120,71 @@ A flag passed on the command line always overrides the config file.
    of this OS's user directories) and walks it looking for the same markers
    Hindsight itself uses per profile (`History` for Chromium-family browsers,
    `places.sqlite` for Firefox/Tor), refining the exact browser from
-   `Preferences`/`prefs.js`.
+   `Preferences`/`prefs.js`. On a live scan, `/proc`, `/sys`, `/dev` and
+   `/run` are skipped. Each profile is also tagged with the OS it came from
+   (from its path layout), and for Linux/macOS profiles HindSweep looks for
+   the out-of-profile cache folder and picks the decrypt mode.
 2. Builds a collision-safe output name per profile from
    `output_name_template` (default `<prefix>_<browser>`; the username is
    appended automatically only if two profiles would otherwise share a name).
 3. Unless `--list-only` was passed, runs `hindsight.py` once per profile with
-   the resolved timezone/format/decrypt/nocopy settings, forcing `-b` to the
-   browser it already detected. For `csv`, Hindsight is told to write `xlsx`;
+   the resolved timezone/format/nocopy settings, forcing `-b` to the browser
+   it already detected, plus `-c`/`-d` where step 1 found them. For `csv`, Hindsight is told to write `xlsx`;
    on success, HindSweep converts every sheet in that xlsx to its own CSV
    file and deletes the xlsx (if conversion fails, the xlsx is kept and the
    profile is marked failed instead). One profile failing doesn't stop the
    rest.
 4. Writes every output file plus `<prefix>_run_summary.csv` (profile path,
-   browser, output file(s), success/failure, elapsed time) and
-   `hindsight.log` into the output directory.
+   browser, source OS, cache path and decrypt mode passed to Hindsight,
+   output file(s), success/failure, elapsed time) and `hindsight.log` into
+   the output directory.
+
+## Linux and macOS profiles
+
+Profile discovery is the same on every OS: HindSweep looks for Hindsight's
+marker files, so it finds profiles wherever they are. That includes the
+default locations Hindsight lists:
+
+| Source | Default Chrome profile path |
+|---|---|
+| Windows Vista-11 | `<userdir>\AppData\Local\Google\Chrome\User Data\Default` |
+| Windows XP | `<userdir>\Local Settings\Application Data\Google\Chrome\User Data\Default` |
+| Linux | `<userdir>/.config/google-chrome/Default` |
+| macOS | `<userdir>/Library/Application Support/Google/Chrome/Default` |
+| iOS | `/Applications/com.google.chrome.ios/Library/Application Support/Google/Chrome/Default` |
+| Android | `/userdata/data/com.android.chrome/app_chrome/Default` |
+| ChromeOS | `/home/user/<GUID>` |
+
+It also finds snap (`~/snap/...`) and flatpak (`~/.var/app/...`) installs,
+and `/root`. Each profile's source OS (`windows`, `linux`, `mac`, `ios`,
+`android`, `chromeos`, or `unknown`) is shown in `--list-only` and in the
+run summary.
+
+On Linux and macOS, two things work differently from Windows. HindSweep
+handles both through Hindsight's own options and doesn't parse anything
+itself:
+
+- **Cache outside the profile.** Linux keeps the browser cache under
+  `~/.cache/...` and macOS under `~/Library/Caches/...`, not in the profile
+  folder, and Hindsight only parses such a cache when given `-c`. If the
+  profile has no cache of its own, HindSweep passes `-c` with the matching
+  cache folder, but only when that folder exists in the evidence. This
+  covers Chromium-family browsers on Linux/macOS (including snap and
+  flatpak) and Firefox on Linux. Hindsight already finds Firefox's cache on
+  Windows and macOS by itself, so HindSweep doesn't pass `-c` there.
+- **Decryption (`decrypt: auto`).** Chromium-family profiles from Linux get
+  `-d linux`; Hindsight decrypts these with Chrome's built-in Linux key, so
+  this works offline on any OS. It needs Hindsight's `pycryptodomex`
+  dependency, and only works for data that wasn't protected by the user's
+  desktop keyring (`v11`). macOS profiles get `-d mac` only on a live scan
+  run on that Mac, because Hindsight reads the key from the local Keychain.
+  Hindsight decrypts Windows data by itself when run on the live Windows
+  machine; HindSweep passes nothing extra for it. Hindsight describes its
+  Linux/Mac decryption as experimental, so if it causes trouble, set
+  `decrypt` to `none` (or pass `-d none`).
+
+Older copies of `hindsweep_config.json` have `"decrypt": null`, which still
+means off. Change it to `"auto"` to get the behaviour above.
 
 ## Local files
 

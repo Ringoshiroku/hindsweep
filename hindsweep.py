@@ -19,6 +19,7 @@ import csv
 import hashlib
 import json
 import os
+import re
 import subprocess
 import time
 
@@ -29,7 +30,7 @@ BUILT_IN_DEFAULTS = {
     'hindsight_path': '../hindsight/hindsight.py',
     'timezone': 'Asia/Jakarta',
     'format': 'csv',
-    'decrypt': None,
+    'decrypt': 'auto',
     'nocopy': False,
     'default_prefix': 'test_case',
     'default_root': None,
@@ -44,6 +45,40 @@ MARKER_FILES = {'History': 'Chrome', 'places.sqlite': 'Firefox'}
 CHROMIUM_VARIANT_PREFS_KEYS = (('edge', 'Edge'), ('brave', 'Brave'), ('vivaldi', 'Vivaldi'))
 TOR_PREFS_MARKERS = ('torbrowser.', 'extensions.torbutton', 'extensions.torlauncher')
 PRUNE_DIR_NAMES = {'node_modules', '.git', '$recycle.bin', 'system volume information'}
+# Live Linux/macOS pseudo-filesystems; matched by absolute path (not name) so a
+# user folder that happens to be called "dev" or "run" is still walked.
+LIVE_PRUNE_PATHS = {'/proc', '/sys', '/dev', '/run'}
+CHROMIUM_VARIANTS = {'Chrome', 'Edge', 'Brave', 'Vivaldi'}
+
+# (regex, source OS) checked in order against the lowercased, forward-slashed
+# profile path, following the default profile paths in Hindsight's README.
+SOURCE_OS_PATTERNS = (
+    (r'/com\.google\.chrome\.ios/', 'ios'),
+    (r'/com\.android\.chrome/|/app_chrome/', 'android'),
+    (r'/home/(user/[0-9a-f]{32,}|chronos)(/|$)', 'chromeos'),
+    (r'/library/application support/', 'mac'),
+    (r'/\.config/|/\.mozilla/|/snap/|/\.var/app/', 'linux'),
+    # Any other profile under /home/<user>/ (e.g. an app-bundled Chromium
+    # like Burp's) is still a Linux home; ChromeOS was matched above.
+    (r'/home/[^/]+/', 'linux'),
+    (r'/appdata/|/application data/|/local settings/', 'windows'),
+)
+
+# Where a profile's cache lives when it's outside the profile directory, as
+# (regex, replacement) over the forward-slashed profile path; the first
+# candidate that exists wins. Windows keeps Chromium's cache in the profile,
+# and Hindsight already finds Windows/macOS Firefox caches on its own, so
+# only the Linux and macOS Chromium plus Linux Firefox layouts are here.
+CHROMIUM_CACHE_REDIRECTS = (
+    (r'/snap/chromium/common/chromium/', '/snap/chromium/common/.cache/chromium/'),
+    (r'(/\.var/app/[^/]+)/config/', r'\1/cache/'),
+    (r'/\.config/', '/.cache/'),
+    (r'/library/application support/', '/Library/Caches/'),
+)
+FIREFOX_CACHE_REDIRECTS = (
+    (r'(/\.var/app/[^/]+)/\.mozilla/firefox/', r'\1/cache/mozilla/firefox/'),
+    (r'/\.mozilla/firefox/', '/.cache/mozilla/firefox/'),
+)
 
 
 def load_config(path):
@@ -59,12 +94,66 @@ def load_config(path):
     return config
 
 
-def default_live_root():
+def default_live_roots():
     if sys.platform.startswith('win'):
-        return os.path.join(os.environ.get('SystemDrive', 'C:'), '\\Users')
+        return [os.path.join(os.environ.get('SystemDrive', 'C:'), '\\Users')]
     if sys.platform == 'darwin':
-        return '/Users'
-    return '/home'
+        return ['/Users', '/var/root']
+    return ['/home', '/root']
+
+
+def to_slashes(path):
+    # Only fold backslashes where they're separators; on Linux/macOS a
+    # backslash is a legal filename character.
+    return path.replace(os.sep, '/') if os.sep != '/' else path
+
+
+def detect_source_os(profile_path):
+    probe = to_slashes(profile_path).lower()
+    for pattern, source_os in SOURCE_OS_PATTERNS:
+        if re.search(pattern, probe):
+            return source_os
+    return 'unknown'
+
+
+def find_external_cache(profile_path, family):
+    # Hindsight only parses a cache outside the profile if given -c. With -c
+    # it reads exactly that folder, so for modern Chromium point it at
+    # Cache/Cache_Data rather than Cache.
+    if family == 'Chrome':
+        if os.path.isdir(os.path.join(profile_path, 'Cache')):
+            return None
+        redirects = CHROMIUM_CACHE_REDIRECTS
+    else:
+        if os.path.isdir(os.path.join(profile_path, 'cache2')):
+            return None
+        redirects = FIREFOX_CACHE_REDIRECTS
+
+    probe = to_slashes(profile_path)
+    for pattern, replacement in redirects:
+        if not re.search(pattern, probe, re.IGNORECASE):
+            continue
+        base = re.sub(pattern, replacement, probe, count=1, flags=re.IGNORECASE).replace('/', os.sep)
+        if family == 'Chrome':
+            for candidate in (os.path.join(base, 'Cache', 'Cache_Data'), os.path.join(base, 'Cache')):
+                if os.path.isdir(candidate):
+                    return candidate
+        elif os.path.isdir(os.path.join(base, 'cache2')):
+            return base
+    return None
+
+
+def resolve_decrypt(setting, profile, live_scan):
+    if setting != 'auto':
+        return setting
+    if profile['browser'] not in CHROMIUM_VARIANTS:
+        return None
+    if profile['source_os'] == 'linux':
+        return 'linux'
+    # Hindsight can only decrypt Mac data live, on the Mac it came from.
+    if profile['source_os'] == 'mac' and live_scan and sys.platform == 'darwin':
+        return 'mac'
+    return None
 
 
 def is_profile_dir(filenames):
@@ -108,28 +197,37 @@ def guess_username(profile_path):
     # own path (e.g. a KAPE collection extracted under their own home dir).
     parts = profile_path.replace('\\', '/').split('/')
     markers = {'users', 'home'}
+    root_children = {'.config', '.mozilla', '.cache', '.var', 'snap', 'library'}
     for i in range(len(parts) - 2, -1, -1):
         if parts[i].lower() in markers:
             return parts[i + 1]
+        # /root (Linux) and /var/root (macOS) aren't under home/Users; only
+        # trust a "root" dir that holds the usual home-dir browser folders.
+        if parts[i] == 'root' and parts[i + 1].lower() in root_children:
+            return 'root'
     digest = hashlib.md5(profile_path.encode('utf-8')).hexdigest()[:6]
     return f'p{digest}'
 
 
-def find_profiles(root, browsers_filter=None):
+def find_profiles(roots, browsers_filter=None):
     profiles = []
-    for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
-        dirnames[:] = [d for d in dirnames if d.lower() not in PRUNE_DIR_NAMES]
-        family = is_profile_dir(filenames)
-        if not family:
-            continue
-        variant = detect_variant(dirpath, filenames, family)
-        if browsers_filter and variant.lower() not in browsers_filter:
-            continue
-        profiles.append({
-            'path': dirpath,
-            'browser': variant,
-            'user': guess_username(dirpath),
-        })
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: None):
+            dirnames[:] = [d for d in dirnames if d.lower() not in PRUNE_DIR_NAMES
+                           and os.path.join(dirpath, d) not in LIVE_PRUNE_PATHS]
+            family = is_profile_dir(filenames)
+            if not family:
+                continue
+            variant = detect_variant(dirpath, filenames, family)
+            if browsers_filter and variant.lower() not in browsers_filter:
+                continue
+            profiles.append({
+                'path': dirpath,
+                'browser': variant,
+                'user': guess_username(dirpath),
+                'source_os': detect_source_os(dirpath),
+                'cache': find_external_cache(dirpath, family),
+            })
     return profiles
 
 
@@ -196,8 +294,10 @@ def run_hindsight(hindsight_path, profile, output_path, config, log_path):
         '-f', hindsight_format,
         '-l', log_path,
     ]
-    if config.get('decrypt'):
-        cmd += ['-d', config['decrypt']]
+    if profile.get('cache'):
+        cmd += ['-c', profile['cache']]
+    if profile.get('decrypt'):
+        cmd += ['-d', profile['decrypt']]
     if config.get('nocopy'):
         cmd.append('--nocopy')
 
@@ -242,7 +342,10 @@ def parse_arguments():
     parser.add_argument('-o', '--prefix', help='Output/case name prefix')
     parser.add_argument('-t', '--timezone', help='Display timezone for output timestamps')
     parser.add_argument('-f', '--format', choices=['csv', 'xlsx', 'jsonl', 'sqlite'], help='Output format')
-    parser.add_argument('-d', '--decrypt', choices=['mac', 'linux'], help='Try to decrypt data from a Mac/Linux system')
+    parser.add_argument('-d', '--decrypt', choices=['auto', 'none', 'mac', 'linux'],
+                        help='Chrome data decryption: "auto" picks per profile (linux for Linux-sourced profiles, '
+                             'mac only on a live scan of this Mac), "none" disables it, "mac"/"linux" force it '
+                             'for every profile')
     parser.add_argument('--nocopy', action='store_true', default=None, help="Don't copy files before opening them")
     parser.add_argument('--browsers', help='Comma-separated list of browsers to include (e.g. chrome,firefox)')
     parser.add_argument('--hindsight-path', help='Path to hindsight.py or hindsight.exe')
@@ -256,11 +359,14 @@ def main():
     args = parse_arguments()
     config = load_config(args.config)
 
-    root = args.root or config['default_root'] or default_live_root()
+    live_scan = not (args.root or config['default_root'])
+    roots = default_live_roots() if live_scan else [args.root or config['default_root']]
     prefix = args.prefix or config['default_prefix']
     config['timezone'] = args.timezone or config['timezone']
     config['format'] = args.format or config['format']
     config['decrypt'] = args.decrypt or config['decrypt']
+    if config['decrypt'] in (None, 'none'):
+        config['decrypt'] = None
     config['nocopy'] = args.nocopy if args.nocopy is not None else config['nocopy']
 
     browsers_filter = None
@@ -276,8 +382,18 @@ def main():
               f'Set "hindsight_path" in {args.config} or pass --hindsight-path.', file=sys.stderr)
         sys.exit(1)
 
-    if not os.path.isdir(root):
-        print(f'Error: root directory "{root}" does not exist.', file=sys.stderr)
+    if live_scan:
+        roots = [r for r in roots if os.path.isdir(r)]
+        for r in [r for r in roots if not os.access(r, os.R_OK | os.X_OK)]:
+            # /root usually needs sudo; say so rather than silently skipping it.
+            print(f'Warning: skipping "{r}" (permission denied; run with sudo to include it).',
+                  file=sys.stderr)
+            roots.remove(r)
+        if not roots:
+            print('Error: none of the live user directories exist; pass -i.', file=sys.stderr)
+            sys.exit(1)
+    elif not os.path.isdir(roots[0]):
+        print(f'Error: root directory "{roots[0]}" does not exist.', file=sys.stderr)
         sys.exit(1)
 
     output_dir = args.output_dir or config['output_dir_template'].format(prefix=prefix)
@@ -286,8 +402,10 @@ def main():
     if config['format'] == 'csv' and not args.list_only:
         check_csv_dependencies()
 
-    print(f'Scanning "{root}" for browser profiles...')
-    profiles = find_profiles(root, browsers_filter)
+    print(f'Scanning {", ".join(f"{r!r}" for r in roots)} for browser profiles...')
+    profiles = find_profiles(roots, browsers_filter)
+    for profile in profiles:
+        profile['decrypt'] = resolve_decrypt(config['decrypt'], profile, live_scan)
 
     if not profiles:
         print('No browser profiles found.')
@@ -298,7 +416,11 @@ def main():
     print(f'Found {len(profiles)} profile(s):')
     for profile, name in zip(profiles, output_names):
         dest = f'{name}_<sheet>.csv (one file per sheet)' if config['format'] == 'csv' else f"{name}.{config['format']}"
-        print(f"  - {profile['browser']:<8} {profile['path']}  ->  {dest}")
+        print(f"  - {profile['browser']:<8} [{profile['source_os']}] {profile['path']}  ->  {dest}")
+        if profile['cache']:
+            print(f"      cache: {profile['cache']}")
+        if profile['decrypt']:
+            print(f"      decrypt: {profile['decrypt']}")
 
     if args.list_only:
         print('\nList-only: no profiles were processed.')
@@ -318,6 +440,9 @@ def main():
         summary_rows.append({
             'profile_path': profile['path'],
             'browser': profile['browser'],
+            'source_os': profile['source_os'],
+            'cache_path': profile['cache'] or '',
+            'decrypt': profile['decrypt'] or '',
             'output_name': '; '.join(os.path.basename(p) for p in output_files),
             'status': status,
             'elapsed_seconds': f'{elapsed:.1f}',
@@ -325,7 +450,8 @@ def main():
 
     summary_path = os.path.join(output_dir, f'{prefix}_run_summary.csv')
     with open(summary_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=['profile_path', 'browser', 'output_name', 'status', 'elapsed_seconds'])
+        writer = csv.DictWriter(f, fieldnames=['profile_path', 'browser', 'source_os', 'cache_path', 'decrypt',
+                                               'output_name', 'status', 'elapsed_seconds'])
         writer.writeheader()
         writer.writerows(summary_rows)
 
